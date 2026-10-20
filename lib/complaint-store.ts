@@ -1,12 +1,8 @@
-import type { Complaint, ComplaintStatus } from './complaints'
-
-/**
- * Temporary in-memory data layer so the UI is fully interactive.
- * Replace these functions with calls to the existing NagrikFix backend/database;
- * every page and server action goes through this module only.
- */
-const globalStore = globalThis as unknown as { __nagrikfixStore?: Map<string, Complaint> }
-const store = (globalStore.__nagrikfixStore ??= new Map<string, Complaint>())
+import 'server-only'
+import { and, asc, desc, eq, ilike, inArray, or } from 'drizzle-orm'
+import { db } from './db'
+import { complaints, complaintUpdates } from './db/schema'
+import type { CategoryValue, Complaint, ComplaintStatus, ComplaintUpdate } from './complaints'
 
 function generateId() {
   const year = new Date().getFullYear()
@@ -14,43 +10,117 @@ function generateId() {
   return `NF-${year}-${random}`
 }
 
+type ComplaintRow = typeof complaints.$inferSelect
+type UpdateRow = typeof complaintUpdates.$inferSelect
+
+function toComplaint(row: ComplaintRow, updates: UpdateRow[]): Complaint {
+  return {
+    id: row.id,
+    title: row.title,
+    category: row.category as CategoryValue,
+    description: row.description,
+    location: row.location,
+    ward: row.ward,
+    reporterName: row.reporterName,
+    reporterPhone: row.reporterPhone ?? undefined,
+    status: row.status as ComplaintStatus,
+    createdAt: row.createdAt.toISOString(),
+    updates: updates.map(
+      (u): ComplaintUpdate => ({
+        status: u.status as ComplaintStatus,
+        note: u.note,
+        at: u.at.toISOString(),
+      }),
+    ),
+  }
+}
+
+async function attachUpdates(rows: ComplaintRow[]) {
+  if (rows.length === 0) return []
+  const updates = await db
+    .select()
+    .from(complaintUpdates)
+    .where(inArray(complaintUpdates.complaintId, rows.map((r) => r.id)))
+    .orderBy(asc(complaintUpdates.at), asc(complaintUpdates.id))
+  return rows.map((row) =>
+    toComplaint(
+      row,
+      updates.filter((u) => u.complaintId === row.id),
+    ),
+  )
+}
+
 export async function listComplaints(filter?: { status?: ComplaintStatus; query?: string }) {
-  const query = filter?.query?.trim().toLowerCase()
-  return [...store.values()]
-    .filter((c) => (filter?.status ? c.status === filter.status : true))
-    .filter((c) =>
-      query
-        ? [c.id, c.title, c.location, c.ward].some((field) => field.toLowerCase().includes(query))
-        : true,
-    )
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  const query = filter?.query?.trim()
+  const pattern = query ? `%${query.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null
+  const conditions = [
+    filter?.status ? eq(complaints.status, filter.status) : undefined,
+    pattern
+      ? or(
+          ilike(complaints.id, pattern),
+          ilike(complaints.title, pattern),
+          ilike(complaints.location, pattern),
+          ilike(complaints.ward, pattern),
+        )
+      : undefined,
+  ].filter(Boolean)
+
+  const rows = await db
+    .select()
+    .from(complaints)
+    .where(conditions.length ? and(...conditions) : undefined)
+    .orderBy(desc(complaints.createdAt))
+    .limit(500)
+  return attachUpdates(rows)
 }
 
 export async function getComplaint(id: string) {
-  return store.get(id.trim().toUpperCase()) ?? null
+  const [row] = await db
+    .select()
+    .from(complaints)
+    .where(eq(complaints.id, id.trim().toUpperCase()))
+    .limit(1)
+  if (!row) return null
+  const [complaint] = await attachUpdates([row])
+  return complaint
 }
 
 export async function createComplaint(
   input: Omit<Complaint, 'id' | 'status' | 'createdAt' | 'updates'>,
 ) {
-  let id = generateId()
-  while (store.has(id)) id = generateId()
-  const now = new Date().toISOString()
-  const complaint: Complaint = {
-    ...input,
-    id,
-    status: 'received',
-    createdAt: now,
-    updates: [{ status: 'received', note: 'Complaint registered and routed to the ward office.', at: now }],
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const id = generateId()
+    const [row] = await db
+      .insert(complaints)
+      .values({ ...input, reporterPhone: input.reporterPhone ?? null, id, status: 'received' })
+      .onConflictDoNothing()
+      .returning()
+    if (!row) continue
+    const [update] = await db
+      .insert(complaintUpdates)
+      .values({
+        complaintId: id,
+        status: 'received',
+        note: 'Complaint registered and routed to the ward office.',
+      })
+      .returning()
+    return toComplaint(row, [update])
   }
-  store.set(id, complaint)
-  return complaint
+  throw new Error('Could not allocate a complaint ID')
 }
 
-export async function updateComplaintStatus(id: string, status: ComplaintStatus, note: string) {
-  const complaint = store.get(id)
-  if (!complaint) return null
-  complaint.status = status
-  complaint.updates.push({ status, note, at: new Date().toISOString() })
-  return complaint
+export async function updateComplaintStatus(
+  id: string,
+  status: ComplaintStatus,
+  note: string,
+  staffUserId: string,
+) {
+  const [row] = await db
+    .update(complaints)
+    .set({ status })
+    .where(eq(complaints.id, id))
+    .returning({ id: complaints.id })
+  if (!row) return null
+  await db.insert(complaintUpdates).values({ complaintId: id, status, note, staffUserId })
+  return row
 }
