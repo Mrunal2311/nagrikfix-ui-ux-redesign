@@ -12,12 +12,12 @@ export function Hero() {
             <span aria-hidden="true" className="h-px w-6 bg-teal" />
             Civic issue reporting
           </p>
-          <h1
+          <h2
             id="hero-heading"
             className="mt-5 text-balance text-4xl font-bold leading-[1.08] tracking-tight text-primary sm:text-5xl lg:text-[3.5rem]"
           >
             See a problem in your street? Get it fixed.
-          </h1>
+          </h2>
           <p className="mt-6 max-w-xl text-pretty text-lg leading-relaxed text-muted-foreground">
             NagrikFix sends your report straight to the ward team responsible for it, and gives you a complaint ID to follow every step until the work is done.
           </p>
